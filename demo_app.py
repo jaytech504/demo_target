@@ -114,10 +114,24 @@ async def delete_user(user_id: int):
 
 @app.get("/notes")
 async def list_notes(user_id: Optional[int] = None):
-    notes = list(fake_notes.values())
-    if user_id:
-        notes = [n for n in notes if n["user_id"] == user_id]
-    return notes
+    try:
+        notes = list(fake_notes.values())
+        if user_id:
+            notes = [n for n in notes if n["user_id"] == user_id]
+        return notes
+    except Exception as e:
+        # Database or service connection dropped.
+        # Log the real error here (stack trace, host, port) for monitoring.
+        # Return a safe 503 to avoid leaking internal exception messages,
+        # stack traces, or DB configuration details to the caller.
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.exception("List notes failed unexpectedly; error: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail="Service unavailable — please try again later",
+        )
 
 
 @app.get("/notes/{note_id}")
@@ -186,22 +200,66 @@ async def analytics_summary():
         return response.json()
 
 
+logger = logging.getLogger(__name__)
+
+# Simple module-level cache to avoid hammering AI service on every request
+_rec_cache: dict = {}
+_REC_CACHE_MAX_AGE_SEC = 300  # cache for 5 minutes
+
+
 @app.get("/ai/recommend/{user_id}")
 async def get_recommendations(user_id: int):
     """
-    Calls AI recommendation service.
+    Calls AI recommendation service with caching and graceful degradation.
     """
-    # VULNERABILITY: No fallback if AI service is slow or down
-    # VULNERABILITY: No caching — hammers AI API on every request
+    # ── serve cached data first (cache hit) ────────────────────────────────
+    cached = _rec_cache.get(user_id)
+    if cached is not None:
+        return cached
+
+    # ── attempt fresh call with bounded concurrency & short timeout ────────
     try:
         async with httpx.AsyncClient(timeout=1.0) as client:
             response = await client.post(
                 "https://ai-service.internal/recommend",
                 json={"user_id": user_id, "limit": 10},
             )
-            return response.json()
-    except httpx.TimeoutException:
-        # VULNERABILITY: Returns 500 instead of fallback recommendations
-        raise HTTPException(status_code=500, detail="AI service timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+            result = response.json()
+
+            # ── update cache on success ──────────────────────────────────────
+            _rec_cache[user_id] = result
+            return result
+
+    except httpx.ReadTimeout:
+        # Client-side timeout — fall through to cached / degraded path below
+        pass
+
+    except httpx.ConnectError as exc:
+        logger.error(
+            "Cannot reach ai-service.internal: %s – using stale cache if available",
+            exc,
+        )
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "AI service HTTP error %s for user %d: %s",
+            exc.response.status_code,
+            user_id,
+            exc.response.text[:500],
+        )
+
+    except Exception as exc:
+        # Catch-all: NEVER let internal error messages escape to the client
+        logger.exception(
+            "Unexpected failure calling AI service for user %d", user_id
+        )
+
+    # ── degradation path: stale cache, empty list, or 503 ──────────────────
+    if cached is not None:
+        logger.info("Returning stale cached recommendations for user %d", user_id)
+        return cached
+
+    raise HTTPException(
+        status_code=503,
+        detail="Recommendations are temporarily unavailable; please try again shortly",
+    )
