@@ -16,6 +16,8 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+import logging
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Knowbite API (Demo Target)",
@@ -68,14 +70,31 @@ async def health():
 
 
 # BUG 1: No exception handling — database errors will crash this
+# At line 15, add to existing import block:
+# import logging
+# logger = logging.getLogger(__name__)
+
 @app.get("/users/{user_id}")
 async def get_user(user_id: str):
-    # Simulates a DB call with no error handling
-    user = USERS.get(user_id)
-    if not user:
-        # BUG: raises a KeyError instead of returning 404
-        return USERS[user_id]
-    return user
+    try:
+        user = USERS.get(user_id)
+        if not user:
+            logger.warning(f"User {user_id} not found in database")
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+    except HTTPException:
+        # Re-raise HTTPException (e.g., the 404 above) unchanged.
+        # Without this block, the broad 'except Exception' below would
+        # catch the self-raised 404 and incorrectly downgrade it to 503.
+        raise
+    except Exception as e:
+        # Catches database connection drops, timeouts, and other unexpected errors.
+        # Logs the real error internally (not exposed to clients).
+        logger.error(f"Error retrieving user {user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please try again later."
+        )
 
 
 # BUG 2: No input validation — null fields crash the handler
