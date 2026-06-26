@@ -16,6 +16,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
+import logging
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Knowbite API (Demo Target)",
@@ -130,12 +132,20 @@ async def get_note(note_id: int):
 
 @app.post("/notes")
 async def create_note(body: NoteCreate):
-    # VULNERABILITY: No check that user_id exists
-    # VULNERABILITY: No error handling at all
-    new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
-    note = {"id": new_id, **body.model_dump()}
-    fake_notes[new_id] = note
-    return note
+    # Payload validation is handled natively by FastAPI before we reach here
+    validated_data = body.model_dump()
+    
+    try:
+        new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
+        note = {"id": new_id, **validated_data}
+        fake_notes[new_id] = note
+        return note
+    except Exception as e:
+        logger.exception("Unexpected error creating note")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        ) from e
 
 
 @app.delete("/notes/{note_id}")

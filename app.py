@@ -16,6 +16,8 @@ import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+from fastapi import HTTPException
+import logging
 
 app = FastAPI(
     title="Knowbite API (Demo Target)",
@@ -81,11 +83,35 @@ async def get_user(user_id: str):
 # BUG 2: No input validation — null fields crash the handler
 @app.post("/users")
 async def create_user(body: UserCreate):
-    # BUG: no duplicate email check, no DB error handling
-    new_id = str(len(USERS) + 1)
-    user = {"id": new_id, **body.model_dump()}
-    USERS[new_id] = user
-    return user
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        # Check for duplicate email before attempting insertion
+        for existing in USERS.values():
+            if existing.get("email") == body.email:
+                raise ValueError(f"Email '{body.email}' already registered")
+
+        # Attempt to persist the new user
+        new_id = str(len(USERS) + 1)
+        user = {"id": new_id, **body.model_dump()}
+        USERS[new_id] = user
+        return user
+
+    except ValueError as e:
+        # Known business-logic error (e.g., duplicate email) — return 409 Conflict
+        raise HTTPException(status_code=409, detail=str(e))
+
+    except Exception as e:
+        # Unknown failure (connection drop, serialization error, etc.)
+        # Log the full traceback server-side for debugging
+        logger.exception("Failed to create user: %s", e)
+        # Never expose internal details or stack traces to the client
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later.",
+        )
 
 
 # BUG 3: Calls external API with no timeout or error handling
