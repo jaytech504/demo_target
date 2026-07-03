@@ -116,10 +116,15 @@ async def delete_user(user_id: int):
 
 @app.get("/notes")
 async def list_notes(user_id: Optional[int] = None):
-    notes = list(fake_notes.values())
-    if user_id:
-        notes = [n for n in notes if n["user_id"] == user_id]
-    return notes
+    try:
+        notes = list(fake_notes.values())
+        if user_id:
+            notes = [n for n in notes if n["user_id"] == user_id]
+        return notes
+    except Exception as e:
+        # Internal tracebacks logged server-side only; client sees no internals
+        logger.exception("Failed to retrieve notes for user_id=%s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/notes/{note_id}")
@@ -132,20 +137,12 @@ async def get_note(note_id: int):
 
 @app.post("/notes")
 async def create_note(body: NoteCreate):
-    # Payload validation is handled natively by FastAPI before we reach here
-    validated_data = body.model_dump()
-    
-    try:
-        new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
-        note = {"id": new_id, **validated_data}
-        fake_notes[new_id] = note
-        return note
-    except Exception as e:
-        logger.exception("Unexpected error creating note")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        ) from e
+    # VULNERABILITY: No check that user_id exists
+    # VULNERABILITY: No error handling at all
+    new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
+    note = {"id": new_id, **body.model_dump()}
+    fake_notes[new_id] = note
+    return note
 
 
 @app.delete("/notes/{note_id}")
@@ -199,19 +196,53 @@ async def analytics_summary():
 @app.get("/ai/recommend/{user_id}")
 async def get_recommendations(user_id: int):
     """
-    Calls AI recommendation service.
+    Get AI-powered recommendations with graceful fallback.
+    Never exposes internal error details to clients.
     """
-    # VULNERABILITY: No fallback if AI service is slow or down
-    # VULNERABILITY: No caching — hammers AI API on every request
-    try:
-        async with httpx.AsyncClient(timeout=1.0) as client:
-            response = await client.post(
-                "https://ai-service.internal/recommend",
-                json={"user_id": user_id, "limit": 10},
-            )
-            return response.json()
-    except httpx.TimeoutException:
-        # VULNERABILITY: Returns 500 instead of fallback recommendations
-        raise HTTPException(status_code=500, detail="AI service timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+    max_retries = 3
+    retry_delay = 0.5
+
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    "https://ai-service.internal/recommend",
+                    json={"user_id": user_id, "limit": 10},
+                )
+                response.raise_for_status()
+                result = response.json()
+                # Cache successful result for future fallback
+                _store_recommendation(user_id, result)
+                return result
+        except httpx.TimeoutException:
+            logger.warning(f"AI service timeout for user {user_id}, attempt {attempt + 1}/{max_retries}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+            break
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"AI service returned {exc.response.status_code}: {exc.response.text[:200]}")
+            break
+        except httpx.RequestError as exc:
+            logger.warning(f"AI service network error for user {user_id}: {type(exc).__name__}, attempt {attempt + 1}/{max_retries}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+            break
+        except Exception as exc:
+            # Log internal error details; never expose to client
+            logger.exception(f"Unexpected error calling AI service for user {user_id}")
+            break
+
+    # All attempts failed — serve safe fallback (no str(e) leaks)
+    cached = _get_cached_recommendation(user_id)
+    if cached:
+        logger.info(f"Returning cached recommendation for user {user_id}")
+        return cached
+
+    logger.warning(f"No cached recommendation for user {user_id}; serving empty default")
+    return {
+        "recommendations": [],
+        "source": "fallback",
+        "message": "AI service temporarily unavailable",
+    }
