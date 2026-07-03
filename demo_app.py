@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
 import logging
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Knowbite API (Demo Target)",
