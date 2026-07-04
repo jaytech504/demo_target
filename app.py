@@ -72,18 +72,54 @@ async def health():
 # BUG 1: No exception handling — database errors will crash this
 @app.get("/users/{user_id}")
 async def get_user(user_id: str):
-    # Simulates a DB call with no error handling
-    user = USERS.get(user_id)
-    if not user:
-        # BUG: raises a KeyError instead of returning 404
-        return USERS[user_id]
-    return user
+    logger = logging.getLogger(__name__)
+    try:
+        user = USERS.get(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to retrieve user '%s': %s", user_id, e)
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while retrieving the user. Please try again later.",
+        )
+            timeout=5.0,
+        )
+        if user is None:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+        return user
+    except asyncio.TimeoutError:
+        logger.warning("Timeout fetching user %s", user_id)
+        raise HTTPException(
+            status_code=504,
+            detail="Request timed out. Please try again later.",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error fetching user %s: %s", user_id, e)
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later.",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log full traceback server-side for debugging
+        logger.exception("Database error while fetching user %s: %s", user_id, e)
+        # Never expose internal details or stack traces to the client
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later.",
+        )
 
 
 # BUG 2: No input validation — null fields crash the handler
 @app.post("/users")
 async def create_user(body: UserCreate):
-    import logging
 
     logger = logging.getLogger(__name__)
 

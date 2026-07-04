@@ -70,8 +70,31 @@ async def health():
 
 @app.get("/users")
 async def list_users():
-    # VULNERABILITY: No error handling — if DB fails, raw exception leaks
-    return list(fake_users.values())
+    try:
+        # Wrap data retrieval with timeout to prevent hangs on slow backends
+        # In production, this wraps the actual async DB query
+        users = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(fake_users.values())),
+            timeout=5.0
+        )
+        return users
+    except asyncio.TimeoutError:
+        logger.error("Timeout retrieving users - operation exceeded 5s limit")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
+    except Exception:
+        logger.exception("Unexpected error retrieving users list")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
+        logger.exception("Failed to retrieve users from data store")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        ) from e
 
 
 @app.get("/users/{user_id}")
