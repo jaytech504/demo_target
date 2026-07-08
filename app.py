@@ -122,6 +122,8 @@ async def get_user(user_id: str):
 async def create_user(body: UserCreate):
 
     logger = logging.getLogger(__name__)
+    max_retries = 3
+    retry_delay = 0.5
 
     try:
         # Check for duplicate email before attempting insertion
@@ -129,18 +131,101 @@ async def create_user(body: UserCreate):
             if existing.get("email") == body.email:
                 raise ValueError(f"Email '{body.email}' already registered")
 
-        # Attempt to persist the new user
+        # Prepare the user record
         new_id = str(len(USERS) + 1)
         user = {"id": new_id, **body.model_dump()}
-        USERS[new_id] = user
-        return user
+
+        # Inline async write — in production, replace with your actual DB call
+        async def _write_user():
+            USERS[new_id] = user
+            return user
+
+        # Retry loop protects against transient DB connection drops
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Timeout guards against slow database responses that would
+                # otherwise block the event loop and degrade all endpoints
+                result = await asyncio.wait_for(_write_user(), timeout=5.0)
+                return result
+            except asyncio.TimeoutError:
+                last_error = asyncio.TimeoutError(
+                    f"Database write timed out after 5.0s (attempt {attempt + 1}/{max_retries})"
+                )
+                logger.warning(
+                    "User creation timed out (attempt %d/%d)", attempt + 1, max_retries
+                )
+            except Exception as write_err:
+                last_error = write_err
+                logger.warning(
+                    "User creation failed (attempt %d/%d): %s",
+                    attempt + 1, max_retries, write_err,
+                )
+
+            # Exponential backoff before retry (skip sleep on last attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (2 ** attempt))
+
+        # All retries exhausted — propagate the last error to outer handlers
+        raise last_error
 
     except ValueError as e:
         # Known business-logic error (e.g., duplicate email) — return 409 Conflict
         raise HTTPException(status_code=409, detail=str(e))
 
+    except asyncio.TimeoutError:
+        # All retry attempts timed out — tell client to retry later with 504
+        logger.warning("All retries exhausted for user creation due to timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="Request timed out after multiple attempts. Please try again later.",
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        # Unknown failure after all retries — log and return generic error
+        logger.exception("Failed to create user after retries: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later.",
+        )
+        # Known business-logic error (e.g., duplicate email) — return 409 Conflict
+        raise HTTPException(status_code=409, detail=str(e))
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         # Unknown failure (connection drop, serialization error, etc.)
+        # Log the full traceback server-side for debugging
+        logger.exception("Failed to create user: %s", e)
+        # Never expose internal details or stack traces to the client
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later.",
+        )
+                # (more accurate than 500 for transient infra failures)
+                logger.exception(
+                    "All %d retries exhausted for create_user: %s",
+                    max_retries, last_error,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Service temporarily unavailable due to a database connection issue. Please try again later.",
+                )
+
+    except ValueError as e:
+        # Known business-logic error (e.g., duplicate email) — return 409 Conflict
+        raise HTTPException(status_code=409, detail=str(e))
+
+    except HTTPException:
+        # Re-raise intentional HTTP errors without modification
+        raise
+
+    except Exception as e:
+        # Unknown failure (serialization error, etc.)
         # Log the full traceback server-side for debugging
         logger.exception("Failed to create user: %s", e)
         # Never expose internal details or stack traces to the client

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
 import logging
+from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -152,23 +153,73 @@ async def get_note(note_id: int):
         raise HTTPException(status_code=404, detail="Note not found")
     return note
 
-
 @app.post("/notes")
 async def create_note(body: NoteCreate):
     # Payload validation is handled natively by FastAPI before we reach here
     validated_data = body.model_dump()
     
-    try:
+    def _write_note():
+        # Synchronous dict write operation runs in thread pool to avoid blocking the event loop
         new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
         note = {"id": new_id, **validated_data}
         fake_notes[new_id] = note
         return note
+    
+    try:
+        # Enforce 5-second timeout to prevent slow database responses from hanging the request
+        note = await asyncio.wait_for(
+            asyncio.to_thread(_write_note),
+            timeout=5.0
+        )
+        return note
+    except asyncio.TimeoutError:
+        logger.error("Timeout creating note - operation exceeded 5s limit")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
     except Exception as e:
         logger.exception("Unexpected error creating note")
         raise HTTPException(
             status_code=503,
             detail="Service temporarily unavailable. Please retry later."
         ) from e
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
+    except Exception as e:
+        logger.exception("Unexpected error creating note")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        ) from e
+                timeout=5.0
+            )
+            return note
+        except asyncio.TimeoutError:
+            # Transient failure — likely a connection drop, safe to retry
+            logger.warning(
+                "Timeout creating note (attempt %d/%d)",
+                attempt + 1, max_retries
+            )
+            if attempt < max_retries - 1:
+                # Exponential backoff: 0.1s, 0.2s — keeps retry window short
+                await asyncio.sleep(min(2 ** attempt * 0.1, 1.0))
+                continue
+            # All retries exhausted — return safe generic message
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later."
+            )
+        except Exception:
+            # Non-transient error — do not retry, fail fast to avoid data corruption
+            logger.exception("Unexpected error creating note")
+            # No 'from e' chaining — prevents exception details (DB URIs,
+            # table names, internal stack traces) from leaking to the client
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later."
+            )
 
 
 @app.delete("/notes/{note_id}")
@@ -181,27 +232,105 @@ async def delete_note(note_id: int):
 @app.post("/payments/charge")
 async def charge_payment(body: PaymentRequest):
     """
-    Calls Stripe API — multiple vulnerabilities here.
+    Calls Stripe API with proper timeout, retry, validation, and error sanitization.
     """
-    # VULNERABILITY: No timeout on external payment API call
-    # VULNERABILITY: Raw Stripe error details leaked to caller
-    # VULNERABILITY: No retry logic on 429
-    # VULNERABILITY: Amount not validated (negative amounts allowed)
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.stripe.com/v1/charges",
-                headers={"Authorization": "Bearer sk_test_fake_key"},
-                data={
-                    "amount": int(body.amount * 100),
-                    "currency": body.currency,
-                    "source": "tok_visa",
-                },
+    # FIX: Validate amount — reject negative or zero amounts before hitting Stripe
+    if body.amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Payment amount must be greater than zero"
+        )
+
+    # FIX: Explicit timeouts prevent hanging on slow external responses
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            # FIX: timeout parameter ensures requests never hang indefinitely
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    "https://api.stripe.com/v1/charges",
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                    data={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "source": "tok_visa",
+                    },
+                )
+
+                # FIX: Retry on 429 rate limiting with exponential backoff
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        retry_after = int(response.headers.get("Retry-After", str(2 ** attempt)))
+                        logger.warning(
+                            "Stripe rate limit hit, retrying in %ds (attempt %d/%d)",
+                            retry_after, attempt + 1, max_retries
+                        )
+                        await asyncio.sleep(retry_after)
+                        continue
+                    # Exhausted retries on 429 — return safe generic message
+                    logger.error("Stripe rate limit exhausted after %d retries", max_retries)
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Payment service is temporarily unavailable due to high demand. Please try again later."
+                    )
+
+                # FIX: raise_for_status triggers HTTPStatusError for non-2xx (except 429 handled above)
+                response.raise_for_status()
+
+                return response.json()
+
+        except httpx.TimeoutException:
+            # FIX: Retry on timeout with exponential backoff before giving up
+            logger.error(
+                "Timeout calling Stripe API (attempt %d/%d)",
+                attempt + 1, max_retries
             )
-            return response.json()
-    except Exception as e:
-        # VULNERABILITY: Full exception including internal details returned
-        return {"error": True, "detail": str(e), "type": type(e).__name__}
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise HTTPException(
+                status_code=504,
+                detail="Payment service timed out. Please try again later."
+            )
+
+        except httpx.ConnectError:
+            # FIX: Retry on connection failure — Stripe may be temporarily unreachable
+            logger.error(
+                "Connection error to Stripe API (attempt %d/%d)",
+                attempt + 1, max_retries
+            )
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise HTTPException(
+                status_code=503,
+                detail="Payment service is currently unavailable. Please try again later."
+            )
+
+        except httpx.HTTPStatusError as e:
+            # FIX: Log the actual status code internally, return sanitized message to client
+            logger.error(
+                "Stripe API returned HTTP %d (attempt %d/%d)",
+                e.response.status_code, attempt + 1, max_retries
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Payment processing failed. Please verify your payment details and try again."
+            )
+
+        except HTTPException:
+            # Re-raise our own HTTPExceptions unchanged (e.g. 400 from validation, 503 from exhausted 429 retries)
+            raise
+
+        except Exception as e:
+            # FIX: Catch-all logs the real error internally, returns only a safe generic message
+            logger.error("Unexpected error in payment processing: %s: %s", type(e).__name__, str(e))
+            raise HTTPException(
+                status_code=500,
+                detail="An unexpected error occurred processing your payment."
+            )
 
 
 @app.get("/analytics/summary")
