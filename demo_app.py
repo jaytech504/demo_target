@@ -70,32 +70,52 @@ async def health():
 
 @app.get("/users")
 async def list_users():
-    try:
-        # Wrap data retrieval with timeout to prevent hangs on slow backends
-        # In production, this wraps the actual async DB query
-        users = await asyncio.wait_for(
-            asyncio.to_thread(lambda: list(fake_users.values())),
-            timeout=5.0
-        )
-        return users
-    except asyncio.TimeoutError:
-        logger.error("Timeout retrieving users - operation exceeded 5s limit")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-    except Exception:
-        logger.exception("Unexpected error retrieving users list")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-        logger.exception("Failed to retrieve users from data store")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        ) from e
-
+    max_retries = 3
+    retry_delay = 0.5
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Wrap data retrieval with timeout to prevent hangs on slow backends
+            # In production, this wraps the actual async DB query
+            users = await asyncio.wait_for(
+                asyncio.to_thread(lambda: list(fake_users.values())),
+                timeout=5.0
+            )
+            return users
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Timeout retrieving users - operation exceeded 5s limit "
+                f"(attempt {attempt}/{max_retries})"
+            )
+            if attempt == max_retries:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Service temporarily unavailable. Please retry later."
+                )
+            await asyncio.sleep(retry_delay * attempt)
+        except (ConnectionError, ConnectionRefusedError, OSError) as e:
+            # Handle database connection drops specifically with retry
+            logger.warning(
+                f"Database connection failure (attempt {attempt}/{max_retries}): {e}"
+            )
+            if attempt == max_retries:
+                logger.error("All retry attempts exhausted for database connection")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database connection unavailable. Please retry later."
+                ) from e
+            await asyncio.sleep(retry_delay * attempt)
+        except Exception as e:
+            # Catch-all for unexpected errors - no internal details leaked
+            logger.exception(
+                f"Unexpected error retrieving users list (attempt {attempt}/{max_retries})"
+            )
+            if attempt == max_retries:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Service temporarily unavailable. Please retry later."
+                ) from e
+            await asyncio.sleep(retry_delay * attempt)
 
 @app.get("/users/{user_id}")
 async def get_user(user_id: int):

@@ -73,23 +73,18 @@ async def health():
 @app.get("/users/{user_id}")
 async def get_user(user_id: str):
     logger = logging.getLogger(__name__)
-    try:
+
+    async def _fetch_user():
         user = USERS.get(user_id)
         if user is None:
-            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+            raise HTTPException(
+                status_code=404,
+                detail=f"User '{user_id}' not found"
+            )
         return user
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to retrieve user '%s': %s", user_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred while retrieving the user. Please try again later.",
-        )
-            timeout=5.0,
-        )
-        if user is None:
-            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+    try:
+        user = await asyncio.wait_for(_fetch_user(), timeout=10.0)
         return user
     except asyncio.TimeoutError:
         logger.warning("Timeout fetching user %s", user_id)
@@ -100,23 +95,11 @@ async def get_user(user_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Unexpected error fetching user %s: %s", user_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred. Please try again later.",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Log full traceback server-side for debugging
         logger.exception("Database error while fetching user %s: %s", user_id, e)
-        # Never expose internal details or stack traces to the client
         raise HTTPException(
             status_code=500,
             detail="An internal error occurred. Please try again later.",
         )
-
-
 # BUG 2: No input validation — null fields crash the handler
 @app.post("/users")
 async def create_user(body: UserCreate):
