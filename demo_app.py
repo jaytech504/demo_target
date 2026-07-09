@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
 import logging
+import time
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -67,34 +68,77 @@ async def root():
 async def health():
     return {"status": "ok"}
 
-
 @app.get("/users")
 async def list_users():
-    try:
-        # Wrap data retrieval with timeout to prevent hangs on slow backends
-        # In production, this wraps the actual async DB query
-        users = await asyncio.wait_for(
-            asyncio.to_thread(lambda: list(fake_users.values())),
-            timeout=5.0
-        )
-        return users
-    except asyncio.TimeoutError:
-        logger.error("Timeout retrieving users - operation exceeded 5s limit")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-    except Exception:
-        logger.exception("Unexpected error retrieving users list")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-        logger.exception("Failed to retrieve users from data store")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        ) from e
+    max_retries = 3
+    # Overall deadline prevents the endpoint from hanging indefinitely.
+    # Worst case without this: 3 retries x (5s timeout + 4s backoff) = ~27s.
+    overall_deadline = time.monotonic() + 10.0
+    start_time = time.monotonic()
+
+    for attempt in range(max_retries):
+        # Check overall budget before each attempt
+        remaining = overall_deadline - time.monotonic()
+        if remaining <= 0:
+            elapsed = time.monotonic() - start_time
+            logger.error(
+                "Overall deadline exceeded after %.1fs retrieving users (attempt %d/%d)",
+                elapsed, attempt + 1, max_retries
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+                headers={"Retry-After": "5"}
+            )
+
+        # Use the smaller of per-attempt timeout or remaining overall budget
+        per_attempt_timeout = min(5.0, remaining)
+
+        try:
+            users = await asyncio.wait_for(
+                asyncio.to_thread(lambda: list(fake_users.values())),
+                timeout=per_attempt_timeout
+            )
+            elapsed = time.monotonic() - start_time
+            logger.info("Retrieved users in %.2fs (attempt %d)", elapsed, attempt + 1)
+            return users
+        except asyncio.TimeoutError:
+            logger.error(
+                "Timeout retrieving users - attempt %d/%d exceeded %.1fs limit",
+                attempt + 1, max_retries, per_attempt_timeout
+            )
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 4)
+                if time.monotonic() + backoff < overall_deadline:
+                    await asyncio.sleep(backoff)
+                continue
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+                headers={"Retry-After": "5"}
+            )
+        except (ConnectionError, OSError) as e:
+            logger.warning(
+                "Connection drop retrieving users - attempt %d/%d: %s",
+                attempt + 1, max_retries, type(e).__name__
+            )
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 4)
+                if time.monotonic() + backoff < overall_deadline:
+                    await asyncio.sleep(backoff)
+                continue
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+                headers={"Retry-After": "5"}
+            )
+        except Exception as e:
+            logger.exception("Unexpected error retrieving users list")
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+                headers={"Retry-After": "5"}
+            ) from e
 
 
 @app.get("/users/{user_id}")
@@ -139,10 +183,26 @@ async def delete_user(user_id: int):
 
 @app.get("/notes")
 async def list_notes(user_id: Optional[int] = None):
-    notes = list(fake_notes.values())
-    if user_id:
-        notes = [n for n in notes if n["user_id"] == user_id]
-    return notes
+    try:
+        notes = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(fake_notes.values())),
+            timeout=5.0
+        )
+        if user_id is not None:
+            notes = [n for n in notes if n["user_id"] == user_id]
+        return notes
+    except asyncio.TimeoutError:
+        logger.error("Timeout retrieving notes - operation exceeded 5s limit")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
+    except Exception:
+        logger.exception("Unexpected error retrieving notes list")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
 
 
 @app.get("/notes/{note_id}")
@@ -157,51 +217,90 @@ async def get_note(note_id: int):
 async def create_note(body: NoteCreate):
     # Payload validation is handled natively by FastAPI before we reach here
     validated_data = body.model_dump()
-    
-    try:
+
+    # Hard deadline prevents the endpoint from hanging indefinitely under load
+    # or when chaos middleware injects artificial delays
+    overall_deadline = time.monotonic() + 5.0
+    start_time = time.monotonic()
+
+    def _create_note_sync():
         new_id = max(fake_notes.keys()) + 1 if fake_notes else 1
         note = {"id": new_id, **validated_data}
         fake_notes[new_id] = note
         return note
-    except Exception as e:
-        logger.exception("Unexpected error creating note")
+
+    try:
+        remaining = overall_deadline - time.monotonic()
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+                headers={"Retry-After": "5"}
+            )
+
+        note = await asyncio.wait_for(
+            asyncio.to_thread(_create_note_sync),
+            timeout=remaining
+        )
+        elapsed = time.monotonic() - start_time
+@app.get("/users")
+async def list_users():
+    try:
+        # Wrap data retrieval with timeout to prevent hangs on slow backends
+        # In production, this wraps the actual async DB query
+        users = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(fake_users.values())),
+            timeout=5.0
+        )
+        return users
+    except asyncio.TimeoutError:
+        logger.error("Timeout retrieving users - operation exceeded 5s limit")
         raise HTTPException(
             status_code=503,
             detail="Service temporarily unavailable. Please retry later."
-        ) from e
+        )
+    except Exception:
+        logger.exception("Unexpected error retrieving users list")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later."
+        )
 
 
-@app.delete("/notes/{note_id}")
-async def delete_note(note_id: int):
-    # VULNERABILITY: Raw KeyError if note doesn't exist
-    del fake_notes[note_id]
-    return {"deleted": note_id}
+@app.get("/notes/{note_id}")
+async def get_note(note_id: int):
+    # Wrap retrieval with timeout to prevent hangs under chaos middleware delays
+    def _lookup_note():
+        note = fake_notes.get(note_id)
+        if note is None:
+            raise HTTPException(status_code=404, detail="Note not found")
+        return note
 
-
-@app.post("/payments/charge")
-async def charge_payment(body: PaymentRequest):
-    """
-    Calls Stripe API — multiple vulnerabilities here.
-    """
-    # VULNERABILITY: No timeout on external payment API call
-    # VULNERABILITY: Raw Stripe error details leaked to caller
-    # VULNERABILITY: No retry logic on 429
-    # VULNERABILITY: Amount not validated (negative amounts allowed)
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.stripe.com/v1/charges",
-                headers={"Authorization": "Bearer sk_test_fake_key"},
-                data={
-                    "amount": int(body.amount * 100),
-                    "currency": body.currency,
-                    "source": "tok_visa",
-                },
-            )
-            return response.json()
-    except Exception as e:
-        # VULNERABILITY: Full exception including internal details returned
-        return {"error": True, "detail": str(e), "type": type(e).__name__}
+        note = await asyncio.wait_for(
+            asyncio.to_thread(_lookup_note),
+            timeout=5.0
+        )
+        return note
+    except asyncio.TimeoutError:
+        logger.error(
+            "Timeout retrieving note id=%s - operation exceeded 5s limit",
+            note_id
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later.",
+            headers={"Retry-After": "5"}
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error retrieving note id=%s", note_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. Please retry later.",
+            headers={"Retry-After": "5"}
+        )
 
 
 @app.get("/analytics/summary")
