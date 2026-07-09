@@ -86,68 +86,6 @@ async def get_user(user_id: str):
             status_code=500,
             detail="An internal error occurred while retrieving the user. Please try again later.",
         )
-            timeout=5.0,
-        )
-        if user is None:
-            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
-        return user
-    except asyncio.TimeoutError:
-        logger.warning("Timeout fetching user %s", user_id)
-        raise HTTPException(
-            status_code=504,
-            detail="Request timed out. Please try again later.",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error fetching user %s: %s", user_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred. Please try again later.",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Log full traceback server-side for debugging
-        logger.exception("Database error while fetching user %s: %s", user_id, e)
-        # Never expose internal details or stack traces to the client
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred. Please try again later.",
-        )
-
-
-# BUG 2: No input validation — null fields crash the handler
-@app.post("/users")
-async def create_user(body: UserCreate):
-
-    logger = logging.getLogger(__name__)
-
-    try:
-        # Check for duplicate email before attempting insertion
-        for existing in USERS.values():
-            if existing.get("email") == body.email:
-                raise ValueError(f"Email '{body.email}' already registered")
-
-        # Attempt to persist the new user
-        new_id = str(len(USERS) + 1)
-        user = {"id": new_id, **body.model_dump()}
-        USERS[new_id] = user
-        return user
-
-    except ValueError as e:
-        # Known business-logic error (e.g., duplicate email) — return 409 Conflict
-        raise HTTPException(status_code=409, detail=str(e))
-
-    except Exception as e:
-        # Unknown failure (connection drop, serialization error, etc.)
-        # Log the full traceback server-side for debugging
-        logger.exception("Failed to create user: %s", e)
-        # Never expose internal details or stack traces to the client
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred. Please try again later.",
-        )
 
 
 # BUG 3: Calls external API with no timeout or error handling
@@ -220,24 +158,72 @@ async def get_course_content(course_id: str):
         return response.json()
 
 
-# BUG 7: Unhandled null — crashes when dependency returns empty body
 @app.get("/courses/{course_id}/analytics")
 async def get_course_analytics(course_id: str):
-    # Simulates calling an analytics service
-    # BUG: doesn't handle empty/null response from analytics service
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        try:
+    _logger = logging.getLogger(__name__)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(
                 f"https://analytics.example.com/courses/{course_id}"
             )
-            data = response.json()
-            # BUG: crashes if 'metrics' key doesn't exist in response
+            if response.status_code != 200:
+                _logger.warning(
+                    "Analytics service returned status %s for course %s",
+                    response.status_code, course_id
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Analytics service returned an error. Please try again later."
+                )
+            try:
+                data = response.json()
+            except (ValueError, TypeError):
+                _logger.warning(
+                    "Analytics service returned non-JSON body for course %s",
+                    course_id
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Analytics service returned invalid data. Please try again later."
+                )
+            metrics = data.get("metrics") if isinstance(data, dict) else None
+            if metrics is None or not isinstance(metrics, dict):
+                _logger.warning(
+                    "Analytics response missing metrics for course %s",
+                    course_id
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Analytics data is incomplete. Please try again later."
+                )
             return {
                 "course_id": course_id,
-                "views": data["metrics"]["views"],
-                "completions": data["metrics"]["completions"],
+                "views": metrics.get("views", 0),
+                "completions": metrics.get("completions", 0),
             }
-        except httpx.ConnectError:
-            # BUG: catches connection error but re-raises as 500 with details
-            raise HTTPException(status_code=500,
-                                detail=f"Analytics service unreachable: {course_id}")
+    except httpx.TimeoutException:
+        _logger.warning("Timeout fetching analytics for course %s", course_id)
+        raise HTTPException(
+            status_code=504,
+            detail="Analytics service timed out. Please try again later."
+        )
+    except httpx.ConnectError:
+        _logger.warning("Analytics service unreachable for course %s", course_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Analytics service is currently unavailable. Please try again later."
+        )
+    except httpx.HTTPError as exc:
+        _logger.exception("HTTP error fetching analytics for course %s: %s", course_id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Analytics service is currently unavailable. Please try again later."
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _logger.exception("Unexpected error fetching analytics for course %s: %s", course_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred. Please try again later."
+        )
