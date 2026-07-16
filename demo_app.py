@@ -181,29 +181,82 @@ async def delete_note(note_id: int):
 @app.post("/payments/charge")
 async def charge_payment(body: PaymentRequest):
     """
-    Calls Stripe API — multiple vulnerabilities here.
+    Calls Stripe API with proper error handling, timeouts, and validation.
     """
-    # VULNERABILITY: No timeout on external payment API call
-    # VULNERABILITY: Raw Stripe error details leaked to caller
-    # VULNERABILITY: No retry logic on 429
-    # VULNERABILITY: Amount not validated (negative amounts allowed)
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.stripe.com/v1/charges",
-                headers={"Authorization": "Bearer sk_test_fake_key"},
-                data={
-                    "amount": int(body.amount * 100),
-                    "currency": body.currency,
-                    "source": "tok_visa",
-                },
+    # Validate amount is positive to prevent invalid payment requests
+    if body.amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Payment amount must be greater than zero"
+        )
+
+    max_retries = 3
+    retry_count = 0
+
+    while retry_count <= max_retries:
+        try:
+            # Set explicit timeout: 5s connect, 10s read to prevent hanging
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=10.0)) as client:
+                response = await client.post(
+                    "https://api.stripe.com/v1/charges",
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                    data={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "source": "tok_visa",
+                    },
+                )
+
+                # Handle rate limiting (429) with exponential backoff retry
+                if response.status_code == 429:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        wait_time = min(2 ** retry_count, 30)
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Payment service is rate limited. Please retry later."
+                    )
+
+                # Handle other Stripe API errors (4xx, 5xx)
+                if response.status_code >= 400:
+                    try:
+                        error_data = response.json()
+                        safe_message = error_data.get("message", "Payment processing failed")
+                    except Exception:
+                        safe_message = "Payment processing failed"
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Payment failed: {safe_message}"
+                    )
+
+                return response.json()
+
+        except httpx.TimeoutException:
+            logger.error(f"Payment API timeout on attempt {retry_count + 1}")
+            retry_count += 1
+            if retry_count <= max_retries:
+                await asyncio.sleep(1)
+                continue
+            raise HTTPException(
+                status_code=504,
+                detail="Payment service timed out. Please retry later."
             )
-            return response.json()
-    except Exception as e:
-        # VULNERABILITY: Full exception including internal details returned
-        return {"error": True, "detail": str(e), "type": type(e).__name__}
-
-
+        except httpx.RequestError as e:
+            logger.error(f"Payment API request error: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail="Payment service unavailable. Please try again."
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error during payment processing")
+            raise HTTPException(
+                status_code=500,
+                detail="Payment processing failed. Please try again."
+            )
 @app.get("/analytics/summary")
 async def analytics_summary():
     """
