@@ -70,33 +70,61 @@ async def health():
 
 @app.get("/users")
 async def list_users():
-    try:
-        # Wrap data retrieval with timeout to prevent hangs on slow backends
-        # In production, this wraps the actual async DB query
-        users = await asyncio.wait_for(
-            asyncio.to_thread(lambda: list(fake_users.values())),
-            timeout=5.0
-        )
-        return users
-    except asyncio.TimeoutError:
-        logger.error("Timeout retrieving users - operation exceeded 5s limit")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-    except Exception:
-        logger.exception("Unexpected error retrieving users list")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        )
-        logger.exception("Failed to retrieve users from data store")
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable. Please retry later."
-        ) from e
+    max_retries = 3
+    base_delay = 0.5  # seconds
 
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Wrap data retrieval with timeout to prevent hangs on slow backends
+            # In production, this wraps the actual async DB query
+            users = await asyncio.wait_for(
+                asyncio.to_thread(lambda: list(fake_users.values())),
+                timeout=5.0,
+            )
+            return users
 
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Timeout retrieving users (attempt {attempt}/{max_retries}) - operation exceeded 5s limit"
+            )
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.info(f"Retrying after {delay}s delay...")
+                await asyncio.sleep(delay)
+                continue
+            # All retries exhausted - return generic error, never expose internals
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+            )
+
+        except Exception as e:
+            # Properly bound exception variable for exception chaining
+            # Check if this is a transient error worth retrying
+            error_str = str(e).lower()
+            is_transient = any(
+                keyword in error_str
+                for keyword in ["connection", "timeout", "refused", "reset", "pool"]
+            )
+
+            if is_transient and attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                # Log error type only, never expose message or stack trace to caller
+                logger.warning(
+                    f"Transient error (attempt {attempt}/{max_retries}): {type(e).__name__}. Retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # Non-transient or final attempt exhausted - fail gracefully
+            # Log internally but return generic message to client
+            logger.error(
+                f"Failed to retrieve users (attempt {attempt}/{max_retries}): {type(e).__name__}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry later.",
+            )
 @app.get("/users/{user_id}")
 async def get_user(user_id: int):
     # VULNERABILITY: KeyError leaks if user not found instead of 404
