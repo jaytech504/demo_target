@@ -181,27 +181,66 @@ async def delete_note(note_id: int):
 @app.post("/payments/charge")
 async def charge_payment(body: PaymentRequest):
     """
-    Calls Stripe API — multiple vulnerabilities here.
+    Calls Stripe API with resilient error handling and input validation.
     """
-    # VULNERABILITY: No timeout on external payment API call
-    # VULNERABILITY: Raw Stripe error details leaked to caller
-    # VULNERABILITY: No retry logic on 429
-    # VULNERABILITY: Amount not validated (negative amounts allowed)
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.stripe.com/v1/charges",
-                headers={"Authorization": "Bearer sk_test_fake_key"},
-                data={
-                    "amount": int(body.amount * 100),
-                    "currency": body.currency,
-                    "source": "tok_visa",
-                },
-            )
-            return response.json()
-    except Exception as e:
-        # VULNERABILITY: Full exception including internal details returned
-        return {"error": True, "detail": str(e), "type": type(e).__name__}
+    # Validate payment amount must be positive
+    if body.amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Amount must be greater than zero"
+        )
+    
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            # Set explicit 10-second timeout to prevent indefinite hangs
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    "https://api.stripe.com/v1/charges",
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                    data={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "source": "tok_visa",
+                    },
+                )
+                
+                # Check for 429 rate limit response
+                if response.status_code == 429:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error("Stripe API rate limit exceeded after %d retries", max_retries)
+                        raise HTTPException(
+                            status_code=429,
+                            detail="Payment rate limit exceeded. Please retry later."
+                        )
+                    logger.warning("Stripe API rate limited, retrying (%d/%d)", retry_count, max_retries)
+                    await asyncio.sleep(2 ** retry_count)
+                    continue
+                
+                # Raise for other HTTP errors (4xx/5xx)
+                response.raise_for_status()
+                return response.json()
+                
+        except httpx.TimeoutException:
+            # Retry on timeout with exponential backoff
+            retry_count += 1
+            if retry_count >= max_retries:
+                logger.error("Stripe API timeout after %d retries", max_retries)
+                raise HTTPException(
+                    status_code=504,
+                    detail="Payment service timeout. Please try again later."
+                )
+            logger.warning("Stripe API timeout, retrying (%d/%d)", retry_count, max_retries)
+            await asyncio.sleep(2 ** retry_count)
+            
+        except Exception as e:
+            # Catch-all: log full exception details internally for debugging
+            logger.exception("Unexpected error processing payment for user %d", body.user_id)
+            # Return sanitized error to prevent leaking internal stack traces or API keys
+            return {"error": True, "detail": "Payment processing failed. Please try again."}
 
 
 @app.get("/analytics/summary")
