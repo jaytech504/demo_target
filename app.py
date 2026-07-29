@@ -84,9 +84,7 @@ async def get_user(user_id: str):
         logger.exception("Failed to retrieve user '%s': %s", user_id, e)
         raise HTTPException(
             status_code=500,
-            detail="An internal error occurred while retrieving the user. Please try again later.",
-        )
-            timeout=5.0,
+            detail="An internal error occurred while retrieving the user. Please try again later.", timeout=5.0,
         )
         if user is None:
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
