@@ -187,20 +187,53 @@ async def enroll_user(body: EnrollRequest):
 # BUG 5: No rate limiting awareness — 429s from payment processor crash the app
 @app.post("/payments/process")
 async def process_payment(body: PaymentRequest):
-    # BUG: calls external payment API with no timeout, retry, or 429 handling
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.stripe.example.com/v1/charges",
-            json={
-                "amount": int(body.amount * 100),
-                "currency": body.currency,
-                "customer": body.user_id,
-            },
-            headers={"Authorization": "Bearer sk_test_fake_key"},
-        )
-        # BUG: doesn't check response status before returning
-        return response.json()
+    logger = logging.getLogger(__name__)
 
+    try:
+        # Configure client with reasonable timeout to prevent hanging on slow responses
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://api.stripe.example.com/v1/charges",
+                json={
+                    "amount": int(body.amount * 100),
+                    "currency": body.currency,
+                    "customer": body.user_id,
+                },
+                headers={"Authorization": "Bearer sk_test_fake_key"},
+            )
+
+            # Handle 429 Too Many Requests — payment service is rate-limited
+            if response.status_code == 429:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Payment service is temporarily overloaded. Please retry later.",
+                )
+
+            # Only return JSON on successful 2xx responses
+            if 200 <= response.status_code < 300:
+                return response.json()
+
+            # For other non-2xx responses, raise HTTPStatusError to be caught below
+            response.raise_for_status()
+
+    except httpx.RequestError as e:
+        # Network-level errors (connection refused, timeout, DNS failure, etc.)
+        # Log full exception server-side for debugging
+        logger.exception("Payment request failed: %s", e)
+        # Return sanitized error to client — never expose internal URLs or details
+        raise HTTPException(
+            status_code=502,
+            detail="Payment processing failed. Please try again later.",
+        )
+    except httpx.HTTPStatusError as e:
+        # HTTP errors (4xx/5xx) that weren't explicitly handled above
+        # Log full exception server-side for debugging
+        logger.exception("Payment HTTP error: %s", e)
+        # Return sanitized error to client
+        raise HTTPException(
+            status_code=502,
+            detail="Payment processing failed. Please try again later.",
+        )
 
 # BUG 6: Timeout on slow external call with no handling
 @app.get("/courses/{course_id}/content")
