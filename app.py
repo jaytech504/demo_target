@@ -187,55 +187,102 @@ async def enroll_user(body: EnrollRequest):
 # BUG 5: No rate limiting awareness — 429s from payment processor crash the app
 @app.post("/payments/process")
 async def process_payment(body: PaymentRequest):
-    # BUG: calls external payment API with no timeout, retry, or 429 handling
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.stripe.example.com/v1/charges",
-            json={
-                "amount": int(body.amount * 100),
-                "currency": body.currency,
-                "customer": body.user_id,
-            },
-            headers={"Authorization": "Bearer sk_test_fake_key"},
-        )
-        # BUG: doesn't check response status before returning
-        return response.json()
+    logger = logging.getLogger(__name__)
+    max_retries = 3
+    retry_delay = 1.0
 
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.post(
+                    "https://api.stripe.example.com/v1/charges",
+                    json={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "customer": body.user_id,
+                    },
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                )
 
-# BUG 6: Timeout on slow external call with no handling
-@app.get("/courses/{course_id}/content")
-async def get_course_content(course_id: str):
-    course = COURSES.get(course_id)
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+                # Handle Rate Limiting (429) specifically before raise_for_status
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+                    raise HTTPException(status_code=429, detail="Payment processor is busy. Please try again later.")
 
-    # BUG: fetches from a slow content CDN with no timeout
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://cdn.example-content.com/courses/{course_id}",
-            timeout=None,   # BUG: no timeout set
-        )
-        return response.json()
+                # Trigger HTTPStatusError for non-2xx codes to use standard httpx handling
+                response.raise_for_status()
 
+                # Handle valid responses
+                try:
+                    data = response.json()
+                    if data is None:
+                        raise ValueError("Empty response")
+                    return data
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Malformed JSON response from provider: {str(e)}")
+                    raise HTTPException(status_code=502, detail="Invalid response format from payment provider.")
 
-# BUG 7: Unhandled null — crashes when dependency returns empty body
-@app.get("/courses/{course_id}/analytics")
-async def get_course_analytics(course_id: str):
-    # Simulates calling an analytics service
-    # BUG: doesn't handle empty/null response from analytics service
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        try:
-            response = await client.get(
-                f"https://analytics.example.com/courses/{course_id}"
-            )
-            data = response.json()
-            # BUG: crashes if 'metrics' key doesn't exist in response
-            return {
-                "course_id": course_id,
-                "views": data["metrics"]["views"],
-                "completions": data["metrics"]["completions"],
-            }
-        except httpx.ConnectError:
-            # BUG: catches connection error but re-raises as 500 with details
-            raise HTTPException(status_code=500,
-                                detail=f"Analytics service unreachable: {course_id}")
+            except HTTPException:
+                # CRITICAL: Re-raise FastAPI HTTPExceptions so they aren't caught by 'except Exception'
+                raise
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                logger.warning(f"Attempt {attempt + 1} failed: Connection/Timeout issue: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=504, detail="Payment gateway timed out. Please check your balance.")
+                await asyncio.sleep(retry_delay * (2 ** attempt))
+            except httpx.HTTPStatusError as e:
+                # Handles non-2xx status codes raised by raise_for_status()
+                logger.error(f"Payment API status error: {e.response.status_code} - {e.response.text}")
+                raise HTTPException(status_code=e.response.status_code, detail="Failed to process payment with provider.")
+            except Exception as e:
+                # Catch-all for unexpected system failures only
+                logger.exception(f"Unexpected error in process_payment: {str(e)}")
+                raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+                )
+
+                # Handle Rate Limiting (429) with exponential backoff
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Rate limited by provider. Retrying attempt {attempt + 1}...")
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+                    raise HTTPException(status_code=429, detail="Payment processor is busy. Please try again later.")
+
+                # Check for other non-2xx status codes
+                if response.status_code != 200:
+                    logger.error(f"Payment API error: {response.status_code} - {response.text}")
+                    # Return the actual provider error status if it is a client error (4xx)
+                    if 400 <= response.status_code < 500:
+                        raise HTTPException(status_code=response.status_code, detail="The payment provider rejected the request.")
+                    # For 5xx, treat as provider degradation
+                    raise HTTPException(status_code=502, detail="Payment provider is experiencing issues.")
+
+                # Handle JSON parsing and empty response bodies
+                try:
+                    data = response.json()
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Malformed JSON response from provider: {str(e)}")
+                    raise HTTPException(status_code=502, detail="Received invalid response from payment provider.")
+
+                if data is None:
+                    logger.error("Provider returned null JSON body")
+                    raise HTTPException(status_code=502, detail="Empty response from payment provider.")
+                
+                return data
+
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+                logger.warning(f"Attempt {attempt + 1} failed: Network/Timeout issue: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=504, detail="Payment gateway connection timed out. Please try again later.")
+                await asyncio.sleep(retry_delay * (2 ** attempt))
+
+            except HTTPException:
+                # Re-raise FastAPI HTTPExceptions
+                raise
+
+            except Exception as e:
+                # Catch-all for unhandled logic errors to prevent leaking traces
+                logger.exception(f"Unexpected error in process_payment: {str(e)}")
+                raise HTTPException(status_code=500, detail="An internal error occurred while processing your payment.")
