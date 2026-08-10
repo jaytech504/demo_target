@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
 import logging
+from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -181,29 +182,59 @@ async def delete_note(note_id: int):
 @app.post("/payments/charge")
 async def charge_payment(body: PaymentRequest):
     """
-    Calls Stripe API — multiple vulnerabilities here.
+    Calls Stripe API with resilience: timeouts, retries, and validation.
     """
-    # VULNERABILITY: No timeout on external payment API call
-    # VULNERABILITY: Raw Stripe error details leaked to caller
-    # VULNERABILITY: No retry logic on 429
-    # VULNERABILITY: Amount not validated (negative amounts allowed)
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.stripe.com/v1/charges",
-                headers={"Authorization": "Bearer sk_test_fake_key"},
-                data={
-                    "amount": int(body.amount * 100),
-                    "currency": body.currency,
-                    "source": "tok_visa",
-                },
-            )
-            return response.json()
-    except Exception as e:
-        # VULNERABILITY: Full exception including internal details returned
-        return {"error": True, "detail": str(e), "type": type(e).__name__}
+    # 1. Validate input to prevent business logic errors (e.g., negative charges)
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
 
+    max_retries = 3
+    retry_delay = 1.0  # Initial delay in seconds
 
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.post(
+                    "https://api.stripe.com/v1/charges",
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                    data={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "source": "tok_visa",
+                    },
+                )
+
+                # 2. Handle Rate Limiting (429) with exponential backoff
+                if response.status_code == 429 and attempt < max_retries - 1:
+                    logger.warning(f"Rate limited by Stripe. Retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+
+                # 3. Handle API-level errors without leaking details
+                if response.is_error:
+                    logger.error(f"Stripe API error: {response.status_code} - {response.text}")
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail="Payment provider returned an error. Please check your details."
+                    )
+
+                return response.json()
+
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                # 4. Handle network latency/timeouts specifically
+                logger.error(f"Network error during payment (attempt {attempt+1}): {str(e)}")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=504, detail="Payment gateway timed out. Please verify if the charge went through before retrying.")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+            except HTTPException:
+                # Re-raise HTTPExceptions caught from the logic above
+                raise
+            except Exception as e:
+                # 5. Catch-all to prevent leaking raw stack traces/internal details
+                logger.exception("Unexpected error during payment processing")
+                raise HTTPException(status_code=500, detail="An internal error occurred while processing your payment.")
 @app.get("/analytics/summary")
 async def analytics_summary():
     """
