@@ -238,3 +238,10 @@ async def get_recommendations(user_id: int):
         raise HTTPException(status_code=500, detail="AI service timeout")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+
+
+@app.get("/crash")
+async def crash():
+    data = None
+    title = data["title"]  # Throws TypeError
+    return {"ok": True}
