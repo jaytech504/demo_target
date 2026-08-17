@@ -243,3 +243,9 @@ async def get_course_analytics(course_id: str):
             # BUG: catches connection error but re-raises as 500 with details
             raise HTTPException(status_code=500,
                                 detail=f"Analytics service unreachable: {course_id}")
+
+@app.get("/crash")
+async def crash():
+    data = None
+    title = data["title"]  # Throws TypeError
+    return {"ok": True}
