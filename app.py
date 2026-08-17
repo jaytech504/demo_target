@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from typing import Optional
 from fastapi import HTTPException
 import logging
+import patchflow
 
 app = FastAPI(
     title="Knowbite API (Demo Target)",
@@ -25,6 +26,9 @@ app = FastAPI(
     version="1.0.0",
 )
 
+patchflow.init(
+    api_key=os.getenv("PATCHFLOW_API_KEY")
+)
 # ── Fake in-memory database ───────────────────────────────────────────────────
 
 USERS = {
