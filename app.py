@@ -10,7 +10,7 @@ Run this on port 8001:
 
 Then point the Chaos Agent at: http://localhost:8001
 """
-
+import os
 import httpx
 import asyncio
 from fastapi import FastAPI, HTTPException
