@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Optional
 from chaos_middleware import ChaosMiddleware
 import logging
+from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -242,6 +243,20 @@ async def get_recommendations(user_id: int):
 
 @app.get("/crash")
 async def crash():
-    data = None
-    title = data["title"]  # Throws TypeError
-    return {"ok": True}
+    try:
+        data = None
+        # The following line causes a TypeError because data is None
+        title = data["title"]
+        return {"ok": True}
+    except TypeError as e:
+        logger.error(f"Unexpected type error in /crash endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while processing the request."
+        ) from e
+    except Exception as e:
+        logger.exception("Unexpected error in /crash endpoint")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred."
+        ) from e
