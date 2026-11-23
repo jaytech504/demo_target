@@ -155,20 +155,56 @@ async def create_user(body: UserCreate):
 # BUG 3: Calls external API with no timeout or error handling
 @app.get("/users/{user_id}/recommendations")
 async def get_recommendations(user_id: str):
+    logger = logging.getLogger(__name__)
     user = USERS.get(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # BUG: no timeout, no retry, no error handling on external call
-    # If this external service is down, the whole endpoint crashes
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://api.example-recommendations.com/v1/recommend",
-            params={"user_id": user_id, "plan": user["plan"]},
-        )
-        return response.json()
+    max_retries = 3
+    timeout_seconds = 5.0
+    
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.get(
+                    "https://api.example-recommendations.com/v1/recommend",
+                    params={"user_id": user_id, "plan": user["plan"]},
+                )
+                
+                # Raise for 4xx/5xx status codes
+                response.raise_for_status()
+                
+                try:
+                    return response.json()
+                except ValueError:
+                    logger.error("Invalid JSON received from recommendation service")
+                    raise HTTPException(status_code=502, detail="Received invalid response from recommendation service.")
 
+            except httpx.TimeoutException:
+                logger.warning("Timeout connecting to recommendation service (attempt %d/%d)", attempt + 1, max_retries)
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=504, detail="Recommendation service timed out.")
+                await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
 
+            except httpx.HTTPStatusError as e:
+                # If it's a 5xx error, we might want to retry
+                if e.response.status_code >= 500 and attempt < max_retries - 1:
+                    logger.warning("Recommendation service returned %s (attempt %d/%d)", e.response.status_code, attempt + 1, max_retries)
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                
+                logger.error("Recommendation service returned error status: %s", e.response.status_code)
+                raise HTTPException(status_code=502, detail="External recommendation service error.")
+
+            except httpx.ConnectError:
+                logger.error("Failed to connect to recommendation service")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=503, detail="Recommendation service is currently unavailable.")
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+            except Exception as e:
+                logger.exception("Unexpected error in recommendation endpoint: %s", e)
+                raise HTTPException(status_code=500, detail="An internal error occurred while fetching recommendations.")
 # BUG 4: Exposes internal error details to users
 @app.post("/enroll")
 async def enroll_user(body: EnrollRequest):
@@ -191,21 +227,61 @@ async def enroll_user(body: EnrollRequest):
 # BUG 5: No rate limiting awareness — 429s from payment processor crash the app
 @app.post("/payments/process")
 async def process_payment(body: PaymentRequest):
-    # BUG: calls external payment API with no timeout, retry, or 429 handling
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.stripe.example.com/v1/charges",
-            json={
-                "amount": int(body.amount * 100),
-                "currency": body.currency,
-                "customer": body.user_id,
-            },
-            headers={"Authorization": "Bearer sk_test_fake_key"},
-        )
-        # BUG: doesn't check response status before returning
-        return response.json()
+    logger = logging.getLogger(__name__)
+    max_retries = 3
+    retry_delay = 1.0  # seconds
 
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.post(
+                    "https://api.stripe.example.com/v1/charges",
+                    json={
+                        "amount": int(body.amount * 100),
+                        "currency": body.currency,
+                        "customer": body.user_id,
+                    },
+                    headers={"Authorization": "Bearer sk_test_fake_key"},
+                )
+                
+                # Handle Rate Limiting (429)
+                if response.status_code == 429:
+                    logger.warning("Payment gateway rate limited. Attempt %d", attempt)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                    raise HTTPException(status_code=429, detail="Payment service is temporarily overloaded. Please try again later.")
 
+                # Check for other HTTP errors (4xx, 5xx)
+                response.raise_for_status()
+
+                # Handle potential empty response
+                try:
+                    return response.json()
+                except ValueError:
+                    logger.error("Payment gateway returned empty or invalid JSON")
+                    raise HTTPException(status_code=502, detail="Invalid response from payment provider.")
+
+            except httpx.TimeoutException:
+                logger.warning("Payment gateway timeout on attempt %d", attempt)
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=504, detail="Payment processing timed out. Please check your transaction status before retrying.")
+                await asyncio.sleep(retry_delay * (attempt + 1))
+
+            except httpx.HTTPStatusError as e:
+                # If it's a 5xx error, we might want to retry
+                if 500 <= e.response.status_code < 600 and attempt < max_retries - 1:
+                    logger.warning("Payment gateway 5xx error: %s. Retrying...", e)
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+                
+                # For 4xx errors (other than 429), do not retry
+                logger.error("Payment gateway client error: %s", e)
+                raise HTTPException(status_code=e.response.status_code, detail="Payment processing failed.")
+
+            except Exception as e:
+                logger.exception("Unexpected error during payment processing")
+                raise HTTPException(status_code=500, detail="An internal error occurred while processing your payment.")
 # BUG 6: Timeout on slow external call with no handling
 @app.get("/courses/{course_id}/content")
 async def get_course_content(course_id: str):

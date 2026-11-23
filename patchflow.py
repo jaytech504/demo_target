@@ -12,11 +12,9 @@ FastAPI / Starlette:
     # That's it — middleware is installed automatically.
 
 Flask:
-    import patchflow
     patchflow.init(api_key="pf_live_...", app=flask_app)
 
 Manual (any Python app):
-    import patchflow
     pf = patchflow.init(api_key="pf_live_...")
     try:
         risky_code()
@@ -387,7 +385,43 @@ def monitor(func: Callable) -> Callable:
         @app.get("/users")
         @patchflow.monitor
         async def get_users():
-            ...
+            import logging
+            from fastapi import HTTPException, status
+            from sqlalchemy.exc import SQLAlchemyError, OperationalError
+            import httpx
+            
+            logger = logging.getLogger(__name__)
+            
+            try:
+                # Logic for fetching users would go here
+                # e.g., users = await db.fetch_all(query)
+                ...
+            except (OperationalError, SQLAlchemyError) as db_err:
+                # Handles db_connection_drop and db_timeout
+                logger.error(f"Database error during get_users: {str(db_err)}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Database service is temporarily unavailable"
+                ) from db_err
+            except ValueError as val_err:
+                # Handles malformed_json or data validation issues
+                logger.error(f"Data validation error in get_users: {str(val_err)}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Malformed request data"
+                ) from val_err
+            except httpx.TimeoutException as timeout_err:
+                logger.error(f"Upstream timeout in get_users: {str(timeout_err)}")
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="Upstream service timeout"
+                ) from timeout_err
+            except Exception as exc:
+                logger.exception("Unexpected error in get_users")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="An unexpected error occurred"
+                ) from exc
     """
     import functools
 
